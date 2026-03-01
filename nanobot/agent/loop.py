@@ -7,9 +7,49 @@ import json
 import re
 import os
 import time
-from contextlib import AsyncExitStack, nullcontext
+from contextlib import AsyncExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+# ── MLflow tracing (optional) ─────────────────────────────────────────────────
+# Enabled when mlflow-skinny is installed and MLFLOW_TRACKING_URI is set.
+# Falls back silently if mlflow is absent or misconfigured.
+_MLFLOW_ENABLED = False
+_mlflow = None
+_SPAN_AGENT = "AGENT"
+_SPAN_LLM = "LLM"
+_SPAN_TOOL = "TOOL"
+
+try:
+    if os.environ.get("MLFLOW_TRACKING_URI"):
+        import mlflow as _mlflow_mod  # type: ignore[import-untyped]
+        from mlflow.entities import SpanType as _SpanType  # type: ignore[import-untyped]
+        _mlflow = _mlflow_mod
+        _SPAN_AGENT = _SpanType.AGENT
+        _SPAN_LLM = _SpanType.LLM
+        _SPAN_TOOL = _SpanType.TOOL
+        _MLFLOW_ENABLED = True
+except Exception:
+    pass  # tracing is optional; log nothing to avoid polluting startup output
+
+
+class _NullSpan:
+    """No-op span used when MLflow tracing is disabled."""
+    def set_inputs(self, *a: Any, **kw: Any) -> None: ...
+    def set_outputs(self, *a: Any, **kw: Any) -> None: ...
+
+
+@contextmanager
+def _null_span():  # type: ignore[return]
+    yield _NullSpan()
+
+
+def _span(name: str, span_type: Any = None):
+    """Return an active MLflow span or a no-op context manager."""
+    if _mlflow is not None:
+        return _mlflow.start_span(name=name, span_type=span_type)
+    return _null_span()
+# ─────────────────────────────────────────────────────────────────────────────
 
 from loguru import logger
 
@@ -239,19 +279,26 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
-            if on_stream:
-                response = await self.provider.chat_stream_with_retry(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                    on_content_delta=_filtered_stream,
-                )
-            else:
-                response = await self.provider.chat_with_retry(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                )
+            with _span(f"llm/{iteration}", _SPAN_LLM) as _llm_span:
+                _llm_span.set_inputs({"model": self.model, "messages": messages})
+                if on_stream:
+                    response = await self.provider.chat_stream_with_retry(
+                        messages=messages,
+                        tools=tool_defs,
+                        model=self.model,
+                        on_content_delta=_filtered_stream,
+                    )
+                else:
+                    response = await self.provider.chat_with_retry(
+                        messages=messages,
+                        tools=tool_defs,
+                        model=self.model,
+                    )
+                _llm_span.set_outputs({
+                    "content": response.content,
+                    "tool_calls": [{"name": tc.name, "args": tc.arguments} for tc in response.tool_calls] if response.has_tool_calls else [],
+                    "finish_reason": str(response.finish_reason),
+                })
 
             usage = response.usage or {}
             self._last_usage = {
@@ -453,10 +500,15 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-            )
+            if _mlflow is not None:
+                _mlflow.set_experiment(key)
+            with _span("agent_run", _SPAN_AGENT) as _s:
+                _s.set_inputs({"channel": channel, "type": "system"})
+                final_content, tools_used, all_msgs = await self._run_agent_loop(
+                    messages, channel=channel, chat_id=chat_id,
+                    message_id=msg.metadata.get("message_id"),
+                )
+                _s.set_outputs({"tools_used": tools_used, "response_length": len(final_content or "")})
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -498,14 +550,19 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-        )
+        if _mlflow is not None:
+            _mlflow.set_experiment(key)
+        with _span("agent_run", _SPAN_AGENT) as _s:
+            _s.set_inputs({"channel": msg.channel, "session": key, "message": msg.content})
+            final_content, tools_used, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+            _s.set_outputs({"response": final_content or "", "tools_used": tools_used})
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
